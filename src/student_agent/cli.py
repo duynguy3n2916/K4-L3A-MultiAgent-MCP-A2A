@@ -27,7 +27,7 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+async def _run(root: Path, clean: bool = False) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -35,29 +35,50 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    if clean:
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
+
+    trace = TraceWriter(trace_path, contracts)
+    remaining_case_ids = [
+        cid for cid in case_set.case_ids if not (output_root / f"{cid}.json").exists()
+    ]
+    if not remaining_case_ids:
+        print("All 100 cases already processed.")
+        return
+
+    while remaining_case_ids:
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while remaining_case_ids:
+                    case_id = remaining_case_ids[0]
+                    case = case_set.cases[case_id]
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    target = output_root / f"{case_id}.json"
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    remaining_case_ids.pop(0)
+                    print(f"Solved {case_id} ({100 - len(remaining_case_ids)}/100)")
+        except Exception as exc:
+            if not remaining_case_ids:
+                break
+            print(f"Connection dropped ({exc}), reconnecting in 2s...")
+            await asyncio.sleep(2.0)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -66,7 +87,12 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run_cmd = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run_cmd.add_argument(
+        "--clean",
+        action="store_true",
+        help="clean previous outputs and traces before running",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -80,13 +106,12 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, clean=getattr(args, "clean", False)))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")
